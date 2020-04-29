@@ -1,0 +1,17 @@
+# Input: get post-dada2 sequences into fasta format (seq.fa)
+
+# Run in phyllo: /home/genevieve/
+
+# Perform alignment in Qiime (default: pynast / the default template is GreenGenes)
+align_seqs.py -i seq.fa -o pynast_aligned_defaults/
+
+# Apply masking to remove gap sites in Qiime (suppress lane mask because arbitrary and instead use gap fraction)
+filter_alignment.py -i ./pynast_aligned_defaults/seq_aligned.fasta -o filtered_alignment/ -s -g 0.8
+
+# Export filtered alignment and run in betula: /mnt/storage/genevieve/FastTree2/
+
+# Run FastTree2 on the masked alignment from within the FastTree2 folder
+./FastTreeMP -gtr -nt -gamma seq_aligned_pfiltered.fasta > FT_tree 
+
+# Import the tree back to R for further analyses
+

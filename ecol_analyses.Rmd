@@ -1,0 +1,1440 @@
+---
+title: "Host neighbourhood shapes bacterial community assembly and specialization on tree species across a latitudinal gradient"
+author: "Genevieve Lajoie"
+output:
+  html_notebook: default
+  html_document:
+  pdf_print: paged
+  pdf_document: default
+---
+
+<br />
+
+## Libraries
+
+Loading libraries.
+
+```{r Libraries, include=FALSE}
+library(reshape2)
+library(vegan)
+library(phyloseq)
+library(ggplot2)
+library(ggmap)
+library(ggsn)
+library(gridExtra)
+library(bipartite)
+library(picante)
+library(igraph)
+library(ecolottery)
+library(tidyr)
+library(pez)
+library(ape)
+library(data.table)
+library(FD)
+library(splitstackshape)
+library(dplyr)
+library(matrixStats)
+library(geiger)
+library(phytools)
+library(paco)
+library(fastDummies)
+library(metricTester)
+library(foreach)
+library(doParallel)
+library(Matrix)
+library(lme4)
+library(car)
+library(dizzy)
+library(rdist)
+library(phyr)
+library(adephylo)
+library(MASS)
+library(usedist)
+```
+
+<br />
+
+## Data import and formatting
+
+### Data import
+
+Importing environment with data objects.
+
+General dataset
+```{r}
+load("/mnt/storage/genevieve/Field2017_code/phyloseq_obj.RData") # Environment generated through 'script_dada3.R'
+```
+
+Data:
+  *metadata* -> sample metadata including environmental variables and host traits
+  *ps* -> phyloseq object containing otu_table, tax_table, sam_data and phy_tree (16S)
+  *ps.epi7K* -> phyloseq object *ps* rarefied to 7000 sequences per sample
+  *comp* -> tree community composition at each plot
+  *comm25K* -> tree community composition (rel.abund) in a 25 km radius of each site (only spp recorded in comp)
+  *site.UTM* -> geographical description of sites
+  *comb.tree* -> Phylogeny of tree species present in this study (Zanne et al. 2014, Ma et al. 2016)
+
+### Study area 
+
+#### Map
+
+Map of sampling sites
+```{r}
+# Get map
+field.map<-get_map(location = c(-80,43,-67,50),
+                                    color = "color",
+                                    source = "google",
+                                    maptype = "satellite",
+                                    zoom = 7) # zoom at 5 for better view of Quebec
+
+ggmap(field.map, extent = "device", ylab = "Latitude", xlab = "Longitude")+
+  geom_point(data=site.UTM, aes(x=Coord.y, y=Coord.x, fill=MAT), size=4, pch=21)+ # Not really a gradient in MAP
+  scale_fill_gradient(low='yellow',high='red')
+```
+
+Maps of sampling plots
+```{r}
+# List of map areas
+mapsa<-list()
+
+for (i in levels(site.UTM$Site)) {
+  
+  sub<-site.UTM[which(site.UTM$Site==i),]
+
+  field.map<-get_map(location = c(min(sub$Coord.y)-0.01,min(sub$Coord.x)-0.01,max(sub$Coord.y)+0.01,max(sub$Coord.x)+0.01),
+                   color = "color",
+                   source = "google",
+                   maptype = "satellite",
+                   zoom = 11)
+
+  bb <- attr(field.map, "bb")
+  bb2 <- data.frame(long = unlist(bb[c(2, 4)]), lat = unlist(bb[c(1,3)]))
+
+mapsa[[i]]<-ggmap(field.map, extent = "device", ylab = "Latitude", xlab = "Longitude") +
+              geom_point(data=sub, aes(x=Coord.y, y=Coord.x, fill=Type), color='black', shape=21, size=3) +
+              ggtitle(i)+
+              theme(plot.title = element_text(hjust = 0.5), plot.margin = unit(c(0.3,0.3,0.3,0.3), "cm"))+
+              #scale_fill_manual(values=c('red','blue'))+
+              scalebar(bb2, dist = 1, dist_unit = 'km', st.size=2, transform = TRUE, model='WGS84', location='topleft',anchor = c(x = bb$ll.lon + 0.1 * (bb$ur.lon - bb$ll.lon), y = bb$ll.lat + 0.1 * (bb$ur.lat - bb$ll.lat)))
+
+}
+
+# Zoomed-in maps of plots
+grid.arrange(grobs=mapsa, ncol=3)
+```
+
+
+#### Tree species composition
+
+Tree composition : Most abundant at the 25 km scale (across all sites)
+```{r}
+# Find which 10 species are most abundant across all sites
+comm25K.m<-comm25K
+comm25K.m$site<-rownames(comm25K.m)
+comm25K.m<-melt(comm25K.m, id.vars='site')
+ab.sp<-acast(comm25K.m, site~variable, value.var='value')
+ab.sum<-sort(colSums(ab.sp), decreasing=T)[1:10]
+
+# Keep only those species
+comm25.s<-comm25K.m[which(comm25K.m$variable%in%names(ab.sum)),]
+
+# Plot
+ggplot(comm25.s, aes(x="",y=value, fill=variable))+
+  geom_bar(stat='identity')+
+  scale_fill_brewer(palette = "Paired")+
+  coord_polar('y', start=0)+
+  theme_bw()+
+  facet_wrap(~site)
+
+```
+
+<br />
+
+## Microbial community turnover
+
+#### Dataframes
+
+Define dataframes of microbial and tree community composition
+```{r}
+## Define mcc matrix
+mcc<-decostand(otu_table(ps.epi7K), method='hellinger')
+
+## Host identity per sample
+host.id<-data.frame(ps.epi7K@sam_data$Species)
+rownames(host.id)<-ps.epi7K@sam_data$Sample_ID
+colnames(host.id)<-'Species'
+
+## Host community composition (plot-level)
+# Df with one comp. row per sample
+Z<-data.frame(sample_data(ps.epi7K))
+Z$name<-paste(Z$Site,Z$Type,Z$Plot,sep='-')
+comp.host<-comp[match(Z$name,rownames(comp)),]
+rownames(comp.host)<-Z$Sample_ID
+comp.host<-decostand(comp.host, 'total')
+#comp.host<-comp.host[,-which(colSums(comp.host)==0)]
+
+## Host community composition (site-level / 25K)
+comp.host.25<-comm25K[match(Z$Site,rownames(comm25K)),]
+rownames(comp.host.25)<-Z$Sample_ID
+
+```
+
+Alternative dataframes with ACESAC only
+```{r}
+# Reformat dataframes: ACESAC only
+acesac.samp<-ps.epi7K@sam_data[which(ps.epi7K@sam_data=='ACESAC'),]$Sample_ID
+acesac.nm<-which(rownames(mcc)%in%acesac.samp)
+comp.host.a<-comp.host[acesac.nm,] # Remove 0-sum columns
+comp.host.a<-comp.host.a[,-which(colSums(comp.host.a)==0)]
+comp.25.a<-comp.host.25[acesac.nm,]
+# comp.25.a<-comp.25.a[,-which(colSums(comp.25.a)==0)] # None
+```
+
+
+
+Define dataframes of host trait variation (CWM and SWM)
+```{r}
+## Plot-level relative community composition
+comp.rel<-decostand(comp, 'total')
+
+# Fill missing trait values with the mean of the species
+for (i in 6:9){
+  for (j in unique(Z$Species)){
+  Z[which(Z$Species==j),i][is.na(Z[which(Z$Species==j),i])==T]<-mean(Z[which(Z$Species==j),i], na.rm=T)
+  }
+}
+
+# Fill the rest of the values with the mean of everything
+for (i in 6:9){
+  Z[,i][is.na(Z[,i])==T]<-mean(Z[,i], na.rm=T)
+  }
+
+# Check if there are NAs left 
+apply(Z[,6:9],2,FUN=function(x) table(is.na(x)))
+
+# Number of traits
+trt.str<-data.frame(Z[,which(colnames(Z)%in%c('SLA','Ca','P',"Wood.dens",'name','Species'))])
+nt<-ncol(trt.str)-2
+
+# Fill missing values with the mean of the species
+for (i in 2:(nt+1)){
+  for (j in unique(trt.str$Species)){
+  trt.str[which(trt.str$Species==j),i][is.na(trt.str[which(trt.str$Species==j),i])==T]<-mean(trt.str[which(trt.str$Species==j),i], na.rm=T)
+  }
+}
+
+## Issue with DBH and Height on this -> Should be taking the max, since we had to take samplable small trees sometimes...
+## Propagate the highest measure per plot for 
+
+# CWM data frame
+cwm.plot<-as.data.frame(matrix(NA, nrow(comp.rel), nt))
+rownames(cwm.plot)<-rownames(comp.rel)
+colnames(cwm.plot)<-paste(colnames(trt.str)[2:(nt+1)],'cwm', sep='_')
+
+ccm<-NULL # The "mystery" object
+# Compute community weighted means
+for (j in 2:(nt+1)){
+    mat<-acast(name~Species, data=trt.str, value.var=colnames(trt.str)[j]) # Plot x trait matrix
+    mat.pa<-decostand(mat, method='pa', na.rm=T) # Presence absence of trait measurements
+    new.comp<-comp.rel[,which(colnames(comp.rel)%in%colnames(mat))] # Abundance matrix with species for which there are measurements of this trait
+    cwm.plot[,j-1]<-rowSums(mat*new.comp, na.rm=T)/rowSums(mat.pa*new.comp, na.rm=T) # Compute relative abundances only from species where a trait value is reported (for now)
+    ccm[[j-1]]<-(new.comp==0)==(is.na(new.comp*mat)) # Output matrix where "F" indicates that there is a trait value missing for a species that is present at a site -> try to find those values / create algorithm to fetch a stand-in value within site or among sites
+    rownames(ccm[[j-1]])<-rownames(mat)
+}
+
+# Plot names were in the same order throughout the calculations
+identical(rownames(mat),rownames(comp.rel))
+
+#######
+
+## Site-level trait composition (25 km)
+# Generate editable community object
+comm25K.b<-comm25K
+
+# SWM data frame, using the 25km community composition
+swm25<-as.data.frame(matrix(NA, nrow(comm25K), nt))
+
+# Add Site variable
+trt.str<-cbind(trt.str,Z$Site)
+colnames(trt.str)[ncol(trt.str)]<-'Site'
+
+ccs<-NULL # The "Mystery" object
+# Compute site weighted means (on non-standardized data)
+for (j in 2:(nt+1)){
+  # Take the mean value
+    mat<-acast(Site~Species, data=trt.str, value.var=colnames(trt.str)[j], fun.aggregate=function(x) mean(na.omit(x))) # Plot x trait matrix
+    mat[is.infinite(mat)==T]<-NA
+    mat.pa<-decostand(mat, method='pa', na.rm=T) # Presence absence of trait measurements
+    comm25K.b<-comm25K.b[na.omit(match(rownames(mat),rownames(comm25K.b))),]
+    new.comp<-comm25K.b[,which(colnames(comm25K.b)%in%colnames(mat))] # Abundance matrix with species for which there are measurements of this trait
+    new.comp<-decostand(new.comp, method='total')
+    swm25[,j-1]<-rowSums(mat*new.comp, na.rm=T)/rowSums(mat.pa*new.comp, na.rm=T) # Compute relative abundances only from species where a trait value is reported (for now)
+    ccs[[j-1]]<-(new.comp==0)==(is.na(new.comp*mat)) # Output matrix where "F" indicates that there is a trait value missing for a species that is present at a site -> try to find those values / create algorithm to fetch a stand-in value within site or among sites
+    rownames(ccs[[j-1]])<-rownames(mat)
+}
+
+rownames(swm25)<-rownames(mat)
+colnames(swm25)<-paste(colnames(trt.str)[2:(nt+1)],'swm25', sep='_')
+
+```
+
+Alternative dataframes with one sample per species per site
+```{r}
+# Reformat microbial community dataframes: ALL Species
+# Keep one occurrence per host species per site (from the plot where it is most abundant)
+
+# Identiying plots where each species is the most abundant within each site
+z.comp<-cbind(Z,comp.host)
+
+####### TO DO:
+
+# Identify sample names of these samples
+sam.site<-NULL
+for (i in unique(z.comp$Species)){
+  for (j in unique(z.comp$Site)){
+    sub<-z.comp[which(z.comp$Species==i&z.comp$Site==j),]
+    colsp<-which(colnames(sub)==i)
+    samid<-sub[sub[,colsp]==max(sub[,colsp]),'Sample_ID']
+    sam.site<-c(sam.site,as.character(samid))
+  }
+}
+
+# Generate new datasets
+mcc.sub<-as.data.frame(mcc[which(rownames(mcc)%in%sam.site),])
+Z.sub<-Z[which(Z$Sample_ID%in%sam.site),]
+comp.host.sub<-comp.host[which(rownames(comp.host)%in%sam.site),]
+comp.25.sub<-comp.host.25[which(rownames(comp.host.25)%in%sam.site),]
+
+```
+
+Define host functional diversity at site scale
+
+```{r}
+### All traits together
+site.list<-list()
+site.abund<-list()
+
+# Take the plot where the species is most abundant as the species-site value.
+
+for (i in unique(Z.sub$Site)){
+  # Trait data
+  sub<-data.frame(Z.sub[which(Z.sub$Site==i),])
+  rownames(sub)<-sub$Species
+  sub<-sub[order(rownames(sub)),c(6:9)] # Order the names alphabetically so they will match abund. vector
+  site.list[[i]]<-dist(decostand(sub, method='standardize'))
+  
+  # Abundance data
+  abund.vec<-comm25K.b[which(rownames(comm25K.b)==i),]
+  abund.vec<-abund.vec/sum(abund.vec)
+  abund.vec<-abund.vec[which(names(abund.vec)%in%rownames(sub))]
+  abund.vec<-abund.vec[order(names(abund.vec))] # Order the names alphabetically so they will match trait vector
+  
+  for (j in 1:length(abund.vec)){
+    if(abund.vec[j]==0) abund.vec[j]<-0.00000001
+  }
+  site.abund[[i]]<-abund.vec
+ 
+  print(i)
+  print(sum(abund.vec)) # what proportion of the total abundance is captured by the species for which we have trait measurements
+}
+
+# # Unequal diversity captured at each site
+# lapply(site.abund, sum) # Minimum is 64% captured diversity. Rarefy all sites to this : gives essentially the same result
+# 
+# site.abund.r<-site.abund
+# for (i in 1:length(site.abund.r)){
+#   sub<-site.abund.r[[i]]
+#   sub<-round(sub*1000)
+#   sub2<-as.data.frame(rrarefy(sub, 640))
+#   if(min(sub2)==0)   sub2<-sub2[,-which(sub2==0)]
+#   site.abund.r[[i]]<-sub2
+# }
+# 
+# Fdis.site<-NULL
+# for (i in 1:length(site.list)){
+#   sub<-site.list[[i]]
+#   sub<-dist_subset(sub, colnames(site.abund.r[[i]]))
+#   com.fd<-fdisp(sub, as.matrix(site.abund.r[[i]]))$FDis
+# Fdis.site<-c(Fdis.site,com.fd)
+# }
+
+Fdis.site<-NULL
+for (i in 1:length(site.list)){
+com.fd<-fdisp(site.list[[i]], as.matrix(site.abund[[i]]))$FDis
+Fdis.site<-c(Fdis.site,com.fd)
+}
+
+
+```
+
+Define dataframe of environmental variation
+```{r}
+## Environmental variation
+comp.env<-as.data.frame(Z[,c('MAT','MAP','name','Sample_ID')])
+rownames(comp.env)<-comp.env$Sample_ID
+comp.env<-comp.env[,-which(colnames(comp.env)=='Sample_ID')]
+comp.env[,c(1:2)]<-decostand(comp.env[,c(1:2)], method='standardize', na.rm=T)
+comp.env<-comp.env[order(rownames(comp.env)),]
+```
+
+#### MCC ~ Sample structure
+
+All species
+```{r}
+# Hierarchical plot structure
+# PERMANOVA
+
+## All Species - all samples
+
+# TEST OF GENERAL DRIVERS OF COMMUNITY STRUCTURE
+
+# MCC distance matrix
+mcc.dist<-vegdist(mcc)
+    
+# Test for an effect of the structure
+plot.str<-data.frame(Z[,which(colnames(Z)%in%c('Species','Plot','Type','Site','MAT'))])
+    
+# Model
+perm.str<-adonis2(mcc.dist ~ Plot:Type:Site + Type:Site + Site, data = plot.str)
+
+# Reporting model
+perm.str
+    
+```
+
+ACESAC only
+```{r}
+ace.dist<-vegdist(mcc[acesac.nm,])
+ace.str<-plot.str[acesac.nm,]
+ace.str<-merge(ace.str, metadata[!duplicated(metadata$Site),c('Site','MAT')], by=c('Site'), all.x=T)
+    
+# Model
+perm.ace<-adonis2(ace.dist~ Type:Site + Site , data=ace.str)
+# Outputting results
+perm.ace
+```
+
+
+### MCC ~ Host Species & Trait Composition
+
+##### All species
+
+Tree taxonomy
+```{r}
+# Test for an effect of tree taxonomy
+tax.str<-data.frame(Z[,which(colnames(Z)%in%c('Family', "Genus", "Species"))])
+mod2<-adonis2(mcc.dist ~ Family + Genus:Family + Species:Genus:Family, data = tax.str)
+mod2
+```
+
+Define model: all species
+```{r}
+#### Comprehensive model of tree composition across scales
+
+# Variation partitioning (all communities). Using only the most abundant host species for the plot-level and the site-level to reduce collinearity.
+mod.comp<-varpart(as.data.frame(mcc), host.id, comp.host[,which(colnames(comp.host)%in%names(ab.sum))], comp.host.25[,which(colnames(comp.host.25)%in%names(ab.sum))], comp.env[,c('MAT')])
+plot(mod.comp)
+
+#### Comprehensive model of tree trait composition across scales
+# Check correlation between tree traits
+trt.str<-data.frame(Z[,which(colnames(Z)%in%c('SLA', 'Ca','P',"Wood.dens"))])
+trt.str<-decostand(trt.str, 'standardize')
+cor(trt.str)
+
+# Use the full dataset: All species
+# Make the full trait dataset
+Z.trt<-Z
+Z.trt<-merge(Z.trt, decostand(cwm.plot, method='standardize'), by.x=c('name'), by.y=c('row.names'), all.x=T)
+Z.trt<-merge(Z.trt, decostand(swm25,method='standardize'), by.x='Site', by.y=c('row.names'), all.x=T)
+Z.trt<-Z.trt[match(rownames(mcc),Z.trt$Sample_ID),]
+rownames(Z.trt)<-Z.trt$Sample_ID
+
+### Model per scale
+
+# Host species
+tg.sp<-varpart(as.data.frame(mcc), host.id, decostand(Z.trt[,c('SLA', "Wood.dens", "P", "Ca")], method='standardize'), comp.env[,c('MAT')])
+plot(tg.sp)
+
+# Host community
+tg.plot<-varpart(as.data.frame(mcc),comp.host[,which(colnames(comp.host)%in%names(ab.sum))], Z.trt[,c('SLA_cwm', "Wood.dens_cwm", "P_cwm", "Ca_cwm")], comp.env[,c('MAT')])
+plot(tg.plot)
+
+# Host site
+tg.site<-varpart(as.data.frame(mcc), comp.host.25[,which(colnames(comp.host.25)%in%names(ab.sum))], Z.trt[,c('SLA_swm25', "Wood.dens_swm25", "P_swm25", "Ca_swm25")], comp.env[,c('MAT')])
+plot(tg.site)
+
+```
+
+Plotting results
+```{r}
+# ALL SPECIES
+
+## HOST SPECIES with individual traits
+mcc.dist<-vegdist(mcc, method='bray')
+# Pcoa for envfit
+mcc.pcoa <- cmdscale(mcc.dist, k=nrow(mcc)-1, eig=T)
+# Percent variance per axis
+mcc.pcoa$eig/sum(mcc.pcoa$eig)
+
+# Envfit Host species
+mi=1
+ma=2
+
+# Groups based on host species ID
+groups<-host.id
+groups<-merge(groups, metadata[,c('Family','Sample_ID')], by.x='row.names', by.y='Sample_ID',all.x=T)
+rownames(groups)<-groups$Row.names
+groups<-groups[,-1]
+
+# Species with at least 5 observations
+absp<-table(groups$Species)[table(groups$Species)>4]
+
+# Envfit of host species ID (only species with at least 5 obs)
+efit.host<-envfit(mcc.pcoa, host.id, choices=c(mi:ma))
+
+# Groups based on site identity
+gr<-Z[,c('Site','Type','Plot')]
+gr$TypePlot<-paste(gr$Type,gr$Plot)
+
+# Envfit of host traits
+efit.trt.host<-envfit(mcc.pcoa, decostand(Z.trt[,c('SLA','Ca','P','Wood.dens')], method='standardize'), choices=c(mi:ma), perm=999)
+
+# Envfit of temperature
+efit.mat<-envfit(mcc.pcoa, Z.trt[,'MAT', drop=F], choices=c(mi:ma))
+
+# Color vector for families
+table(groups$Family) # need 11 colors
+colvec<-c(brewer.pal(n = 9, name = "Set1")[-6], brewer.pal(n = 12, name = "Set3")[c(1)], '#FFCC00',brewer.pal(n = 9, name = "Greys")[9])  # remove yellow from Set1
+# Reorder colors to attribute red to Sapindaceae and blue to Pinaceae and green to Betulaceae and orange to Fagaceae, Rosaceae in violet
+plot(c(1:11), col=colvec, pch=16)
+levels(groups$Family)
+colvec[c(10,1)]<-colvec[c(1,10)]
+colvec[c(7,2)]<-colvec[c(2,7)]
+colvec[c(1,3)]<-colvec[c(3,1)]
+colvec[c(4,8)]<-colvec[c(8,4)]
+colvec.full<-colvec[(as.numeric(groups$Family)-1)] # Remove 1 because n=1 does not exist
+
+# Species-based color vector representing families
+groupscol<-groups[order(groups$Species),]
+groupscol<-groupscol[!duplicated(groupscol),]
+groupscol$Fam<-groupscol$Family
+spcol.fam<-as.numeric(groupscol$Family)
+spcol.fam<-colvec[(spcol.fam-1)]
+
+# Plotting
+# Host species with their traits
+par(mar=c(3,3,3,3))
+pl<-ordiplot(mcc.pcoa, choices=c(1,2), type='none')
+points(pl, 'sites', col=colvec.full, bg=colvec.full, cex=0.8, pch=21) # pch=as.numeric(groups$Species)
+
+# Ellipses
+ordiellipse(mcc.pcoa, groups$Species, display = "sites", kind = "se", lty=c(1), conf = 0.95, lwd = 0.25, draw='polygon', col=spcol.fam, alpha = 0.15, choices=c(1,2), show.groups=as.character(names(absp)), label=T) # , label=T
+
+plot(efit.trt.host, p.max=0.05, col='black', cex=1) #col='black',  cex=0.8
+plot(efit.mat, lty=3, col='black', cex=1)
+
+# Print leged on the side
+legend("center", legend = c(as.character(groupscol$Family[!duplicated(groupscol$Family)])), pch=16, col = c(spcol.fam[!duplicated(spcol.fam)]), cex=1.0)
+
+```
+
+```{r}
+### PLOT
+## 
+mcc.dist<-vegdist(mcc, method='bray')
+# Pcoa for envfit
+mcc.pcoa <- cmdscale(mcc.dist, k=nrow(mcc)-1, eig=T)
+
+# Envfit Host species
+mi=1
+ma=2
+
+# Plot composition
+mainhost<-names(ab.sum) # OR
+mainhost<-names(absp)
+efit.plot<-envfit(mcc.pcoa, comp.host[,which(colnames(comp.host)%in%mainhost)], choices=c(mi:ma))
+
+# Color species arrows by family
+gc<-groupscol[which(groupscol$Species%in%rownames(efit.plot$vectors$arrows)),]
+spcol.fam2<-as.numeric(gc$Family)
+spcol.fam2<-colvec[(spcol.fam2-1)]
+
+# Plot traits
+# Envfit Plot species
+efit.trt.plot<-envfit(mcc.pcoa, decostand(Z.trt[,c('SLA_cwm','Ca_cwm','P_cwm','Wood.dens_cwm')], method='standardize'), choices=c(mi:ma))
+
+# MAT
+efit.mat<-envfit(mcc.pcoa, Z[,'MAT', drop=F], choices=c(mi:ma))
+
+# Plotting
+# Host species with their traits
+par(mar=c(3,3,3,3))
+pl<-ordiplot(mcc.pcoa, choices=c(1,2), type='none')
+points(pl, 'sites', col='grey', bg='grey', cex=0.8, pch=21) # pch=as.numeric(groups$Species)
+
+# Ellipses (do not use species with fewer than 4 observations)
+
+#ordiellipse(mcc.pcoa, groups$Species, display = "sites", kind = "se", lty=c(1), conf = 0.95, lwd = 0.25, draw='polygon', col=spcol.fam, alpha = 0.15, choices=c(1,2), show.groups=as.character(names(absp)), label=T) # , label=T
+
+plot(efit.plot, col=spcol.fam2, cex=0.8) #col='black',  cex=0.8
+plot(efit.trt.plot, p.max=0.05, col='black', cex=0.8) #col='black',  cex=0.8
+plot(efit.mat, lty=3, col='black', cex=0.8)
+
+# Output legend separately
+legend("topright", legend = c(as.character(gc$Family[!duplicated(gc$Family)])), pch=16, col = c(spcol.fam2[!duplicated(spcol.fam2)]), cex=0.8)
+
+```
+
+```{r}
+### Site
+
+## Sites
+mcc.dist<-vegdist(mcc, method='bray')
+# Pcoa for envfit
+mcc.pcoa <- cmdscale(mcc.dist, k=nrow(mcc)-1, eig=T)
+# Envfit Host species
+mi=1
+ma=2
+
+# Plot composition
+mainhost1<-names(ab.sum)# Most abundant regionally
+mainhost2<-names(absp) # Most abundant in the dataset
+mainhost<-intersect(mainhost1,mainhost2) # Intersect between the two
+efit.site<-envfit(mcc.pcoa, comp.host.25[,which(colnames(comp.host.25)%in%mainhost)], choices=c(mi:ma), perm=999)
+
+# Color species arrows by family
+gc<-groupscol[which(groupscol$Species%in%rownames(efit.site$vectors$arrows)),]
+spcol.fam2<-as.numeric(gc$Family)
+spcol.fam2<-colvec[(spcol.fam2-1)]
+
+# Site traits
+# Envfit Plot species
+efit.trt.site<-envfit(mcc.pcoa, decostand(Z.trt[,c('SLA_swm25','Ca_swm25','P_swm25','Wood.dens_swm25')], method='standardize'), choices=c(mi:ma))
+
+# MAT
+efit.mat<-envfit(mcc.pcoa, Z[,'MAT', drop=F], choices=c(mi:ma))
+
+# Ellipses by sites
+# Groups based on host species ID
+groups.site<-host.id
+groups.site<-merge(groups.site, metadata[,c('Site','Sample_ID')], by.x='row.names', by.y='Sample_ID',all.x=T)
+rownames(groups.site)<-groups.site$Row.names
+groups.site<-groups.site[,-1]
+
+
+# Plotting
+# Host species with their traits
+par(mar=c(3,3,3,3))
+pl<-ordiplot(mcc.pcoa, choices=c(1,2), type='none')
+points(pl, 'sites', col='grey', bg='grey', cex=0.8, pch=21) # pch=as.numeric(groups$Species)
+
+# Ellipses for sites
+ordiellipse(mcc.pcoa, groups.site$Site, display = "sites", kind = "se", lty=c(1), conf = 0.95, lwd = 0.25, draw='polygon', alpha = 0.15, choices=c(1,2), label=T) # , label=T
+
+
+plot(efit.site, p.max=0.05, col=spcol.fam2, cex=0.8) #col='black',  cex=0.8
+plot(efit.trt.site, p.max=0.05, col='black', cex=0.8) #col='black',  cex=0.8
+plot(efit.mat, lty=3, col='black', cex=0.8)
+
+# Add legend afterwards
+legend("topright", legend = c(as.character(gc$Family[!duplicated(gc$Family)])), pch=16, col = c(spcol.fam2[!duplicated(spcol.fam2)]), cex=0.8)
+
+
+```
+
+CHECK WHAT TO DO WITH THIS: MAYBE JUST CLEAN AND LEAVE THERE (eventhough it's not in the paper)
+##### Sugar maple
+Define model: ACESAC
+```{r}
+#### Comprehensive model of tree composition across scales
+# Variation partitioning (sugar maple)
+# Model
+mod.comp<-varpart(as.data.frame(mcc)[acesac.nm,], comp.host.a[,which(colnames(comp.host.a)%in%names(ab.sum))], comp.25.a[,which(colnames(comp.25.a)%in%names(ab.sum))], comp.env[acesac.nm,c('MAT','MAP')])
+plot(mod.comp)
+
+### Variation is captured equally by variation at the plot- and at the site-level
+### Environmental variation among sites is absorbed by site-level variation (when adding comp.env)
+# Most variation captured by the Site (but logically, there is less variation in the single traits of ACESAC between each other than oveall trait variation in the landscape - little effect of the plot)
+
+#### Comprehensive model of tree trait composition across scales
+
+# Variance partitioning between tree traits, cwm tree traits and site traits
+mod.trt<-varpart(as.data.frame(mcc)[acesac.nm,], decostand(Z.trt[acesac.nm,c('SLA', "Height_m", "Wood.dens", "P", "Ca")], method='standardize'), Z.trt[acesac.nm,c('SLA_cwm', "Height_m_cwm", "Wood.dens_cwm", "P_cwm", "Ca_cwm")], Z.trt[acesac.nm,c('SLA_swm25', "Height_m_swm25", "Wood.dens_swm25", "P_swm25", "Ca_swm25")], comp.env[acesac.nm,c('MAT','MAP')]) #
+plot(mod.trt)
+
+### Model per scale
+
+# Host species
+tg.as<-varpart(as.data.frame(mcc)[acesac.nm,], decostand(Z.trt[,c('SLA', "Height_m", "Wood.dens", "P", "Ca")], method='standardize'), comp.env[,c('MAT')])
+plot(tg.as)
+
+# Host community
+tg.plot.as<-varpart(as.data.frame(mcc)[acesac.nm,],comp.host[acesac.nm,which(colnames(comp.host)%in%names(ab.sum))], Z.trt[acesac.nm,c('SLA_cwm', "Height_m_cwm", "Wood.dens_cwm", "P_cwm", "Ca_cwm")], comp.env[acesac.nm,c('MAT')])
+plot(tg.plot.as)
+
+# Host site
+tg.site.as<-varpart(as.data.frame(mcc), comp.host.25[acesac.nm,which(colnames(comp.host.25)%in%names(ab.sum))], Z.trt[acesac.nm,c('SLA_swm25', "Height_m_swm25", "Wood.dens_swm25", "P_swm25", "Ca_swm25")], comp.env[acesac.nm,c('MAT')])
+plot(tg.site.as)
+
+### Regardless of the plot type, species more abundant in the south will have a larger influence on MCC composition in the south, and species more abundant in the north will have a larger influence on MCC composition in the north. Effect gets stronger when using site-level host community composition: Largely aligned along the temperature gradient, so hard to see if it is an effect of temperature or host community composition
+
+
+```
+
+Plotting results
+```{r}
+## 
+#  Individual-level traits
+# Overlay
+mcc.dist<-vegdist(mcc[acesac.nm,], method='bray')
+# Pcoa for envfit
+mcc.pcoa <- cmdscale(mcc.dist, k=nrow(mcc[acesac.nm,])-1, eig=T)
+# Percent variance per axis
+mcc.pcoa$eig/sum(mcc.pcoa$eig)
+
+# Flip axis 1
+mcc.pcoa$points[,1]<-mcc.pcoa$points[,1]*(-1)
+
+# Envfit Host species
+mi=1
+ma=2
+
+# Envfit of host traits
+efit.trt.host<-envfit(mcc.pcoa, decostand(Z.trt[acesac.nm,c(9,10,12,14)], method='standardize'), choices=c(mi:ma), perm=999)
+
+# Envfit of temperature
+efit.mat<-envfit(mcc.pcoa, Z.trt[acesac.nm,'MAT', drop=F], choices=c(mi:ma))
+
+# PLOT
+# Host species with their traits
+par(mar=c(3,3,3,3))
+pl<-ordiplot(mcc.pcoa, choices=c(1,2), type='none')
+points(pl, 'sites', col='black',  cex=0.8, pch=21) # pch=as.numeric(groups$Species)
+
+# Ellipses (do not use species with fewer than 4 observations)
+
+#ordiellipse(mcc.pcoa, groups$Species, display = "sites", kind = "se", lty=c(1), conf = 0.95, lwd = 0.25, draw='polygon', col=spcol.fam, alpha = 0.15, choices=c(1,2), show.groups=as.character(names(absp)), label=T) # , label=T
+
+# Spiders
+#ordispider(mcc.pcoa, groups$Species, display = "sites", kind = "se", lty=c(1), conf = 0.95, alpha = 0.05, lwd = 0.25, draw='polygon', col=groupscol$Family, choices=c(1,2)) # , label=T
+
+#plot(efit.host, col='black', cex = 0.8, labels = levels(groups$Species))
+
+plot(efit.trt.host, col='black', cex=0.8) # col='black',  cex=0.8
+plot(efit.mat, lty=3, col='black', cex=0.8)
+
+```
+
+```{r}
+# Plot-level traits
+# Overlay
+mcc.dist<-vegdist(mcc[acesac.nm,], method='bray')
+# Pcoa for envfit
+mcc.pcoa <- cmdscale(mcc.dist, k=nrow(mcc[acesac.nm,])-1, eig=T)
+
+# Flip axis 1
+mcc.pcoa$points[,1]<-mcc.pcoa$points[,1]*(-1)
+
+# Envfit Host species
+mi=1
+ma=2
+
+# Envfit Plot species
+mainhost<-names(ab.sum) # or
+mainhost<-names(absp)
+efit.plot<-envfit(mcc.pcoa, comp.host.a[,which(colnames(comp.host.a)%in%mainhost)], choices=c(mi:ma))
+
+# Color species arrows by family
+gc<-groupscol[which(groupscol$Species%in%rownames(efit.plot$vectors$arrows)),]
+spcol.fam2<-as.numeric(gc$Family)
+spcol.fam2<-colvec[(spcol.fam2-1)]
+
+# Envfit of temperature
+efit.mat<-envfit(mcc.pcoa, Z.trt[acesac.nm,'MAT', drop=F], choices=c(mi:ma))
+
+# Plot traits
+# Envfit Plot species
+efit.trt.plot<-envfit(mcc.pcoa, decostand(Z.trt[acesac.nm,c(26,27,29,31)], method='standardize'), choices=c(mi:ma))
+
+# Plotting
+# Host species with their traits
+par(mar=c(3,3,3,3))
+pl<-ordiplot(mcc.pcoa, choices=c(1,2), type='none')
+points(pl, 'sites', col='black', cex=0.8, pch=21) # pch=as.numeric(groups$Species)
+
+# Ellipses (do not use species with fewer than 4 observations)
+
+#ordiellipse(mcc.pcoa, groups$Species, display = "sites", kind = "se", lty=c(1), conf = 0.95, lwd = 0.25, draw='polygon', col=spcol.fam, alpha = 0.15, choices=c(1,2), show.groups=as.character(names(absp)), label=T) # , label=T
+
+
+plot(efit.plot, p.max=0.05, col=spcol.fam2, cex=0.8) #col='black',  cex=0.8
+plot(efit.trt.plot, col='black', cex=0.8) #col='black',  cex=0.8
+plot(efit.mat, lty=3, col='black', cex=0.8)
+
+legend("topright", legend = c(as.character(gc$Family[!duplicated(gc$Family)])), pch=16, col = c(spcol.fam2[!duplicated(spcol.fam2)]), cex=0.8)
+
+
+```
+
+```{r}
+# SITE
+## Sites
+mcc.dist<-vegdist(mcc[acesac.nm,], method='bray')
+# Pcoa for envfit
+mcc.pcoa <- cmdscale(mcc.dist, k=nrow(mcc[acesac.nm,])-1, eig=T)
+# Envfit Host species
+mi=1
+ma=2
+
+# Plot composition
+mainhost1<-names(ab.sum)# Most abundant regionally
+mainhost2<-names(absp) # Most abundant in the dataset
+mainhost<-intersect(mainhost1,mainhost2) # Intersect between the two
+efit.site<-envfit(mcc.pcoa, comp.25.a[,which(colnames(comp.25.a)%in%mainhost)], choices=c(mi:ma), perm=999)
+
+# Color species arrows by family
+gc<-groupscol[which(groupscol$Species%in%rownames(efit.site$vectors$arrows)),]
+spcol.fam2<-as.numeric(gc$Family)
+spcol.fam2<-colvec[(spcol.fam2-1)]
+
+# Site traits
+# Envfit Plot species
+efit.trt.site<-envfit(mcc.pcoa, decostand(Z.trt[acesac.nm,c(34,35,37,39)], method='standardize'), choices=c(mi:ma))
+
+# MAT
+efit.mat<-envfit(mcc.pcoa, Z[acesac.nm,'MAT', drop=F], choices=c(mi:ma))
+
+# Ellipses by sites
+groups.site<-as.data.frame(comp.25.a[,c(1:2)])
+groups.site<-merge(groups.site, metadata[,c('Site','Sample_ID')], by.x='row.names', by.y='Sample_ID',all.x=T)
+rownames(groups.site)<-groups.site$Row.names
+groups.site<-groups.site[,-c(1:3), drop=F]
+
+
+# Plotting
+par(mar=c(3,3,3,3))
+pl<-ordiplot(mcc.pcoa, choices=c(1,2), type='none')
+points(pl, 'sites', col='black', cex=0.8, pch=21) # pch=as.numeric(groups$Species)
+
+# Ellipses for sites
+ordiellipse(mcc.pcoa, groups.site$Site, display = "sites", kind = "se", lty=c(1), conf = 0.95, lwd = 0.25, draw='polygon', alpha = 0.15, choices=c(1,2), label=T) # , label=T
+
+
+plot(efit.site, p.max=0.05, col=spcol.fam2, cex=0.8) #col='black',  cex=0.8
+plot(efit.trt.site, p.max=0.05, col='black', cex=0.8) #col='black',  cex=0.8
+plot(efit.mat, lty=3, col='black', cex=0.8)
+
+legend("topright", legend = c(as.character(gc$Family[!duplicated(gc$Family)])), pch=16, col = c(spcol.fam2[!duplicated(spcol.fam2)]), cex=0.8)
+
+```
+
+
+
+## Specialization
+
+Using the DSI approach: MPD between the interacting partners, compared with randomization of the partner phylogenetic tree (Jorge et al. 2014, Ecol. Let.; Jorge et al. 2017, Oecol.)
+
+#### Site -> species specialization
+
+On 1 species occurrence per site
+1- Preparing datasets
+```{r}
+# DSI as mean phylogenetic distance between hosts
+
+# Use mcc.sub for community composition
+
+# Create a list of dataframes (n=nsite) with host species as rows and ASVs as columns
+# Then proceed with calculating the specialization index
+# Need count data
+
+# Perform it on the 8 most abundant species at each site
+# 8 most abundant host species at every site
+# Based on regional abundances 
+gb<-Z.trt[which(Z.trt$Sample_ID%in%sam.site),]
+gb<-merge(gb,comm25K.m, by.x=c('Site','Species'),by.y=c('site','variable'), all.x=T)
+# Some species have 0-values -> change these for the lowest observed across all plots
+gb[which(gb$value==0),'value']<-min(comm25K.m[which(comm25K.m$value>0),'value'])
+
+# For each site, calculate the number of host species
+table(gb$Site) # -> minimum species is 8
+
+gb.n<-NULL
+for (i in 1:length(unique(gb$Site))){
+  sub<-gb[which(gb$Site==unique(gb$Site)[i]),]
+  sub<-sub[-which(sub$Species=='ACESAC'),]
+  sub<-sub[order(sub$value, decreasing=T),]
+  gb.n<-rbind(gb.n,sub[c(1:7),])
+}
+
+gb.new<-rbind(gb.n,gb[which(gb$Species=='ACESAC'),])
+
+# See if we are still picking the ACESAC at each site (losing 1 - so make sure ACESAC is kept each time)
+table(gb.new$Species)
+gb.new$Species<-droplevels(gb.new$Species)
+
+# WITH ACESAC = HI
+mcc.p<-data.frame(otu_table(ps.epi7K))
+mcc.p<-mcc.p[which(rownames(mcc.p)%in%gb.new$Sample_ID),] # gb.new$Sample_ID or sam.site
+mcc.p<-mcc.p[,-which(colSums(mcc.p)==0)]
+mcc.sub.m<-merge(metadata[,c('Site','Sample_ID','Species')], mcc.p, by.x='Sample_ID', by.y='row.names', all.y=T)
+
+# ASV occurrence data per species and site
+mcc.site<-list()
+for (i in unique(mcc.sub.m$Site)){
+  sub<-mcc.sub.m[which(mcc.sub.m$Site==i),]
+  rownames(sub)<-sub$Species
+  df.s<-sub[,-which(colnames(sub)%in%c('Species','Site','Sample_ID'))]
+  df.s<-df.s[,-which(colSums(df.s)==0)]
+  mcc.site[[i]]<-t(df.s)
+}
+
+### Pick most abundant ASVs per site
+
+# Presence of long branches in the phylogeny, remove these before the selection of the 500 to make sure ASV id numbers are the same between specialization and filtering
+
+# Identify nodes for these ASV
+nn<-ps.epi7K@phy_tree$edge[which(ps.epi7K@phy_tree$edge.length>1),]
+
+# Get descendants of that node
+getDescendants<-function(tree,node,curr=NULL){
+  if(is.null(curr)) curr<-vector()
+  daughters<-tree$edge[which(tree$edge[,1]==node),2]
+  curr<-c(curr,daughters)
+  w<-which(daughters>=length(tree$tip))
+  if(length(w)>0) for(i in 1:length(w))
+    curr<-getDescendants(tree,daughters[w[i]],curr)
+  return(curr)
+}
+
+d1<-getDescendants(ps.epi7K@phy_tree, node=nn[1,2])
+d1<-d1[-which(d1>Ntip(ps.epi7K@phy_tree))]
+d2<-getDescendants(ps.epi7K@phy_tree, node=nn[2,2])
+d2<-d2[-which(d2>Ntip(ps.epi7K@phy_tree))]
+
+# 500 most abundant
+mcc.site.500<-list()
+for (i in 1:length(mcc.site)){
+  sub<-mcc.site[[i]]
+  sub<-sub[-which(rownames(sub)%in%ps.epi7K@phy_tree$tip.label[c(d1,d2)]),]
+  newa<-sort(rowSums(sub), decreasing=T)[1:500]
+  mcc.site.500[[i]]<-sub[which(rownames(sub)%in%names(newa)),]
+}
+names(mcc.site.500)<-names(mcc.site)
+
+
+```
+
+2- Calculating specialization
+```{r}
+# Unweighted by host species abundance
+# From dataset with 500 ASV most abundant at each site
+
+dsi.site8<-NULL #
+
+for (i in 1:length(mcc.site.500)){
+
+df.site1<-mcc.site.500[[i]] # VAL-HI-P1
+# Crop plant phylo
+plnt.phy<-drop.tip(comb.tree, comb.tree$tip.label[-which(comb.tree$tip.label%in%colnames(df.site1))])
+# All host species weights are equal
+comps<-as.data.frame(rep(1,ncol(df.site1)))
+rownames(comps)<-colnames(df.site1)
+
+# Run specialization algo
+dsi.res<-dsi(df.site1, plnt.phy, comps, Rep = 1000, DSICom = T)
+# See code for interpretation : https://rdrr.io/github/leorjorge/dizzy/src/R/DSI.R
+dsi.res$site<-names(mcc.site.500)[i]
+dsi.res$sp<-rownames(dsi.res)
+
+dsi.site8<-rbind(dsi.site8,dsi.res) # or dsi.site.lo
+
+}
+
+hist(dsi.site8$DSI.st)
+
+# Number of ASVs per site (is taking the most abundant 8 actually controlling for site differences in ASV diversity)
+lapply(mcc.site.500,nrow)
+
+#save(dsi.site, file='/mnt/storage/dsisite.RData')
+#load('/mnt/storage/dsisite.RData')
+```
+
+3- Calculating average host species scores
+```{r}
+# Melting the 500 dataset
+# HI
+mcc.500.m<-NULL
+for (i in 1: length(mcc.site.500)){
+  sub<-melt(mcc.site.500[[i]])
+  sub$Site<-names(mcc.site.500[i])
+  mcc.500.m<-rbind(mcc.500.m,sub)
+}
+
+colnames(mcc.500.m)[2]<-c('Species')
+mcc.500.m<-merge(mcc.500.m, Z.sub[which(Z.sub$Sample_ID%in%gb.new$Sample_ID),c('Sample_ID','Site','Species')], by=c('Site','Species'), all.x=T)
+mcc.500.a<-as.data.frame(acast(mcc.500.m, Sample_ID~Var1, value.var='value', fill=0))
+
+# LO
+# mcc.500.m<-NULL
+# for (i in 1: length(mcc.site.500)){
+#   sub<-melt(mcc.site.500[[i]])
+#   sub$Site<-names(mcc.site.500[i])
+#   mcc.500.m<-rbind(mcc.500.m,sub)
+# }
+# 
+# colnames(mcc.500.m)[2]<-c('Species')
+# mcc.500.m<-merge(mcc.500.m, Z.trt[which(Z.trt$Sample_ID%in%sam.site.lo),c('Sample_ID','Site','Species')], by=c('Site','Species'), all.x=T)
+# mcc.500.a<-as.data.frame(acast(mcc.500.m, Sample_ID~Var1, value.var='value', fill=0))
+
+# Community matrix
+comm.obs.s<-mcc.500.a
+
+# Merge community composition with the specialization scores
+dsi.spe<-merge(mcc.500.m[-which(mcc.500.m$value==0),], dsi.site8, by.x=c('Site','Var1'), by.y=c('site','sp'), all.x=T)
+
+# ASV relative abundances on each plant
+comm.sub.m<-melt(as.matrix(comm.obs.s))
+comm.sub.m<-merge(comm.sub.m, metadata[,c('Sample_ID','Site','Species')], by.x='Var1',by.y='Sample_ID', all.x=T)
+comm.sub.m<-comm.sub.m[-which(comm.sub.m$value==0),]
+comm.sub.m<-comm.sub.m[,-1]
+
+# Add ASV abundances to the specialization object
+dsi.spe.m<-merge(dsi.spe, comm.sub.m, by.x=c('Site','Species','Var1'), by.y=c('Site','Species','Var2'), all.x=T)
+dsi.spe.m$Species<-droplevels(dsi.spe.m$Species)
+
+# Calculate weighted means of ASV specialization scores by host species by site
+dsi.spa.w<-NULL
+for (i in 1:length(unique(dsi.spe.m$Site))){
+  for (j in 1:length(unique(dsi.spe.m$Species))){
+    sub<-dsi.spe.m[which(dsi.spe.m$Site==unique(dsi.spe.m$Site)[i]&dsi.spe.m$Species==unique(dsi.spe.m$Species)[j]),]
+    if(nrow(sub)>0){
+    wgtv<-weighted.mean(sub$DSI.st, sub$value.x)
+    dsi.spa.w<-rbind(dsi.spa.w, c(as.character(unique(dsi.spe.m$Site)[i]), as.character(unique(dsi.spe.m$Species)[j]), wgtv))
+    }
+  }
+}
+
+dsi.spa.w<-as.data.frame(dsi.spa.w)
+colnames(dsi.spa.w)<-c('Site','Species','DSI.st')
+dsi.spa.w$DSI.st<-as.numeric(as.character(dsi.spa.w$DSI.st))
+
+```
+
+
+#### Site -> species filtering
+
+```{r}
+# Let's continue with the 8 host species selected above
+# And the 500 ASV from every site
+# Select samples from the ASV community matrix
+
+# Drop ASV that are not in that subset
+phy.s<-drop.tip(ps.epi7K@phy_tree, ps.epi7K@phy_tree$tip.label[c(d1,d2)])
+phy.s<-drop.tip(phy.s, phy.s$tip.label[-which(phy.s$tip.label%in%colnames(comm.obs.s))])
+
+# Alternative
+#phy.s$edge.length[which(phy.s$edge.length>1)]<-median(phy.s$edge.length)
+
+# Force ultrametric
+phy.s<-force.ultrametric(phy.s, method='extend')
+
+# Splitting by site and then shuffling species id
+
+# Sample from ASV.site.pa
+ cl<-makeCluster(6)
+ registerDoParallel(cl)
+
+spd8<-foreach(i=1:length(unique(metadata$Site)), .combine='rbind', .multicombine=T, .packages=c('picante')) %dopar% { # nrow(comm.obs)
+
+  site<-unique(metadata$Site)[i]
+  met.sit<-Z.trt[which(Z.trt$Site==site),'Sample_ID']
+  cos<-comm.obs.s[which(rownames(comm.obs.s)%in%met.sit),]
+  cos<-cos[,-which(colSums(cos)==0)]
+  # If using null model taxa.labels, need to subset the phylogeny to those taxa only present at the site
+  phy.s2<-drop.tip(phy.s, phy.s$tip.label[-which(phy.s$tip.label%in%colnames(cos))])
+
+  spd<-ses.mpd(cos, cophenetic(phy.s2), null.model = c("taxa.labels"), abundance.weighted= TRUE, # try "taxa.labels" as well, richness
+    runs = 999, iterations = 1000) # include.root=F
+
+  spd
+
+ }
+
+stopImplicitCluster()
+ 
+hist(spd8$mpd.obs.z)
+ 
+```
+
+#### Explanatory models : Variation among sites
+
+```{r}
+### Full object (can also work with dsi.spa.w)
+# Create working object
+spec<-dsi.site8
+# Add metadata to it
+spec<-merge(spec, Z.sub[which(!duplicated(Z.sub$Site)),c('Site','MAT')], by.x=c('site'),by.y=('Site'), all.x=T)
+spec$DSI.st[spec$DSI.st<(-1)]<-(-1)
+
+spec$site<-factor(spec$site, levels=c('VAL','VER','SMS','JAC','MEG','GAT','MSH','PRO','FRO'))
+
+# Variation among sites
+ggplot(spec, aes(x=site, y=DSI.st))+
+  geom_boxplot()+
+  theme_bw()+
+  theme(axis.text = element_text(size=14), axis.title=element_text(size=16))+
+  labs(y='Specialization', x='Site')
+
+# Test by weighing relative abundances
+Anova(lm(DSI.st~site, spec), type='II')
+TukeyHSD(aov(lm(DSI.st~site, spec)))
+```
+
+#### Explanatory models : MAT
+
+```{r}
+### CWM object
+spec.w<-dsi.spa.w
+spec.w<-merge(spec.w, Z.sub[which(Z.sub$Sample_ID%in%gb.new$Sample_ID),], by=c('Site','Species'), all.x=T)
+
+# Model
+summary(lm(DSI.st~MAT, spec.w)) # Significant negative relationship
+
+### CODE USED IN THE PAPER
+
+# Only mat
+Anova(lm(DSI.st~MAT, spec.w), type='III')
+
+# Distribution of residuals
+plot(lm(DSI.st~MAT, spec.w))
+
+# host species and mat
+Anova(lm(DSI.st~Species+MAT, spec.w), type='III')
+
+# Distribution of residuals
+plot(lm(DSI.st~Species+MAT, spec.w))
+
+```
+
+Plotting
+```{r}
+# MAT vs Spec.
+ggplot(spec.w, aes(x=MAT, y=DSI.st))+
+  geom_point()+
+  geom_smooth(method='lm', se=F)+
+  theme_bw()+
+  theme(axis.text = element_text(size=16), axis.title=element_text(size=16))+
+  labs(y='Specialization', x='Mean annual temperature (deg C)')
+```
+
+#### Explanatory models : Filtering 
+
+Filtering
+```{r}
+# Append filtering data to the specialization object
+spec.filt<-merge(spec.w, spd8, by.x=c('Sample_ID'),by.y=c('row.names'), all.x=T)
+
+# Plot relationships between specialization and filtering on a host
+ggplot(spec.filt, aes(x=-mpd.obs.z, y=DSI.st))+
+  geom_point()+
+#  geom_smooth(method='lm', se=F)+
+  theme_bw()+
+  theme(axis.text = element_text(size=16), axis.title=element_text(size=16))+
+  labs(y='Specialization', x='Filtering')
+
+
+# Model -> No significant relationship
+summary(lm(DSI.st~mpd.obs.z, spec.filt))
+plot(lm(DSI.st~mpd.obs.z, spec.filt))
+```
+
+
+#### Variation among host species
+
+```{r}
+
+### Does specialization differ among host species?
+
+# Plot this relationship
+# Variation observed among species
+# Species present in more than 2 plots
+nm.sp<-names(table(spec.filt$Species)[table(spec.filt$Species)>2])
+
+# Family colors
+
+spec.filt3<-spec.filt[which(spec.filt$Species%in%nm.sp),]
+spec.filt3$Species<-droplevels(spec.filt3$Species)
+spec.filt3$Species<-factor(spec.filt3$Species, levels=c('ACEPEN','ACERUB','ACESAC','ACESPI','BETALL','BETPAP','FAGGRA','QUERUB','ABIBAL','PICRUB','TSUCAN'))
+
+ggplot(spec.filt3, aes(x=Species, y=DSI.st, fill=Family))+
+  geom_boxplot()+
+  scale_fill_manual(values=c("#4DAF4A", "#FFCC00", "#377EB8", "#E41A1C"))+
+  theme_bw()+
+  theme(axis.text = element_text(size=14), axis.title=element_text(size=16), axis.text.x = element_text(angle = 90, hjust = 1), legend.key.size = unit(2,"line"), legend.text=element_text(size=12))+
+ # ylim(NA, 1.0)+
+  labs(y='Specialization (DSI*)', x='Host species')
+
+# Model
+Anova(lm(DSI.st~Species, spec.filt3), type='III')
+
+Anova(lm(DSI.st~Family, spec.filt3), type='III')
+
+# Can't do Tukey on Species, not enough samples for all pairwise comparisons. Do it among families.
+TukeyHSD(aov(lm(DSI.st~Family, spec.filt3))) # It's alright to use TuKeyHSD for unequal sample sizes because it uses the Tukey-Kramer method which controls for unbalanced designs
+
+
+```
+
+
+#### Explanatory models : Host traits
+
+Individual species traits
+```{r}
+# Plots
+ggplot(spec.filt, aes(x=Wood.dens, y=DSI.st))+ # Replace SLA by other traits to generate other graphs
+  geom_point()+ 
+ # geom_smooth(method='lm', se=F)+
+  theme_bw()+
+  theme(axis.text = element_text(size=16), axis.title=element_text(size=16))+
+  labs(y='Specialization', x='Wood dens')
+
+# Models
+md.sla<-lm(DSI.st~scale(SLA, center = TRUE, scale = TRUE), spec.filt)
+summary(md.sla)
+
+md.ca<-lm(DSI.st~scale(Ca, center=T, scale=T), spec.filt)
+summary(md.ca)
+
+md.p<-lm(DSI.st~scale(P, center=T, scale=T), spec.filt)
+summary(md.p)
+
+md.wd<-lm(DSI.st~scale(Wood.dens, center=T, scale=T), spec.filt)
+summary(md.wd)
+
+```
+
+Site-level traits
+```{r}
+# Append swm
+spec.filt<-merge(spec.filt, swm25, by.x='Site', by.y='row.names',all.x=T)
+
+# Plot relationships
+ggplot(spec.filt, aes(x=SLA_swm25, y=DSI.st, color=Species))+ # Change trait names for other traits
+  geom_point()+
+  geom_smooth(method='lm', se=F)
+
+md.sla<-lm(DSI.st~scale(SLA_swm25, center = TRUE, scale = TRUE), spec.filt)
+summary(md.sla)
+
+md.ca<-lm(DSI.st~scale(Ca_swm25, center=T, scale=T), spec.filt)
+summary(md.ca)
+
+md.p<-lm(DSI.st~scale(P_swm25, center=T, scale=T), spec.filt)
+summary(md.p)
+
+md.wd<-lm(DSI.st~scale(Wood.dens_swm25, center=T, scale=T), spec.filt)
+summary(md.wd)
+```
+
+#### Explanatory models : Functional diversity 
+
+```{r}
+# Merge Fdis metric
+spec.filt<-merge(spec.filt, Fdis.site, by.x='Site', by.y='row.names', all.x=T)
+colnames(spec.filt)[ncol(spec.filt)]<-'fdis.site'
+
+# Plot relationships
+# Slight negative relationship
+ggplot(spec.filt, aes(fdis.site, DSI.st))+
+  geom_point()+
+  #geom_smooth(method='lm', se=F)+
+  theme_bw()+
+  theme(axis.text = element_text(size=16), axis.title=element_text(size=16))+
+  labs(y='Specialization', x='Host functional diversity')
+
+# Not significant
+summary(lm(DSI.st~fdis.site, spec.filt))
+
+# With the 500
+# Merge Fdis metric
+spec<-merge(spec, Fdis.site, by.x='site', by.y='row.names', all.x=T)
+colnames(spec)[ncol(spec)]<-'fdis.site'
+
+```
+
+
+#### Explanatory models : Abundance (ACESAC) 
+
+Calculate specialization metric for every ACESAC sample to compare HI and LO abundance
+```{r}
+# Composition data to work on
+mcc.ab<-data.frame(otu_table(ps.epi7K))
+# ACESAC samples
+Z.trt.a<-Z.trt[which(Z.trt$Species=='ACESAC'),]
+
+# Run in parallel
+cl<-makeCluster(7)
+registerDoParallel(cl)
+
+dsi.ace8<-foreach(i=unique(gb.n$Site), .combine='rbind', .multicombine=T, .packages=c('dizzy','ape')) %dopar% { #
+
+  # Non ACESAC samples from site i
+  samp<-as.character(gb.n[which(gb.n$Site==i), c('Sample_ID')])
+  # All ACESAC samples from site i
+  samp.a<-as.character(unique(Z.trt.a[which(Z.trt.a$Site==i),c('Sample_ID')]))
+  
+  # Extract composition data for these samples
+  dsi.ace.all<-NULL
+  for (j in 1:length(samp.a)){
+  # Composition data
+  mcc.a<-mcc.ab[which(rownames(mcc.ab)%in%c(samp,samp.a[j])),]
+  mcc.a<-mcc.a[,-which(colSums(mcc.a)==0)]
+  # Keep only ASV from the 500 at this site
+  mcc.a<-mcc.a[,which(colnames(mcc.a)%in%rownames(mcc.site.500[[i]]))]
+  mcc.t<-t(mcc.a)
+  
+  # Add colnames based on host species names
+  colnames(mcc.t)<-Z.trt$Species[match(colnames(mcc.t),Z.trt$Sample_ID)]
+  
+  # Keep only ASV that are observed on ACESAC
+  mcc.500.ac<-mcc.t
+  # # Keep only those that are observed on ACESAC
+  mcc.500.ac<-mcc.t[which(mcc.t[,c('ACESAC')]>0),]
+  
+  # Calculate specialization of ACESAC ASVs only
+  
+  # Crop plant phylo
+  plnt.phy<-drop.tip(comb.tree, comb.tree$tip.label[-which(comb.tree$tip.label%in%colnames(mcc.500.ac))])
+  # All host species weights are equal
+  comps<-as.data.frame(rep(1,ncol(mcc.500.ac)))
+  rownames(comps)<-colnames(mcc.500.ac)
+  
+  # Run specialization algo
+  dsi.ace<-dsi(mcc.500.ac, plnt.phy, comps, Rep = 1000, DSICom = T)
+  # See code for interpretation : https://rdrr.io/github/leorjorge/dizzy/src/R/DSI.R
+  dsi.ace$site<-i
+  dsi.ace$sp<-rownames(dsi.ace)
+  dsi.ace$Sample_ID<-samp.a[j]
+  
+  dsi.ace.all<-rbind(dsi.ace.all,dsi.ace)
+  
+  }
+  
+  dsi.ace.all
+
+}
+
+stopImplicitCluster()
+
+```
+
+Examine relationship with abundance (non-weighted means)
+```{r}
+# Merge with plot-level community composition
+ab.dsi<-merge(dsi.ace8, comp.host.a[,c('ACESAC'), drop=F], by.x='Sample_ID', by.y='row.names', all.x=T)
+colnames(ab.dsi)[ncol(ab.dsi)]<-'ab.local'
+
+# Merge with 25km ACESAC community composition
+ab.dsi<-merge(ab.dsi, comp.25.a[,c('ACESAC'), drop=F], by.x='Sample_ID', by.y='row.names', all.x=T)
+
+
+# Merge with temperature
+ab.dsi<-merge(ab.dsi, Z.trt[,c('Sample_ID','MAT')], by='Sample_ID', all.x=T)
+
+# General model
+
+# Number of ASV
+length(unique(ab.dsi$sp)) # 1605
+
+# Keep those that occur in all sites to see if there is intra-asv variation in the strength of specialization
+# Number of ASV per site # strong gradient variation: maybe control by taking only x asvs per site
+sp.site<-aggregate(sp~site, ab.dsi, length)
+
+sp.len<-aggregate(site~sp, ab.dsi, FUN=function(x) length(unique(x)))
+
+ab.dsi.sub<-ab.dsi[which(ab.dsi$sp%in%sp.len$sp[which(sp.len$site==9)]),]
+length(unique(ab.dsi.sub$sp)) # 114 present at all sites
+# replace the scores less than -1 to -1
+ab.dsi.sub$DSI.st[ab.dsi.sub$DSI.st<(-1)]<-(-1)
+
+### Models
+# Local abundance
+Anova(lm(DSI.st~ab.local*sp, ab.dsi.sub))
+plot(lm(DSI.st~ab.local*sp, ab.dsi.sub))
+
+
+# Regional abundance
+Anova(lm(DSI.st~ACESAC*sp, ab.dsi.sub))
+plot(lm(DSI.st~ACESAC*sp, ab.dsi.sub))
+
+# Plot
+ggplot(ab.dsi.sub, aes(MAT, DSI.st, color=sp))+
+  geom_point()+
+  geom_smooth(method='lm', se=F)
+
+```
+
+Calculate weighted mean per sample
+
+```{r}
+# Community matrix
+mcc.ab.m<-mcc.ab[which(rownames(mcc.ab)%in%dsi.ace8$Sample_ID),]
+mcc.ab.m<-melt(as.matrix(mcc.ab))
+
+# Merge community composition with the specialization scores
+dsi.spe.ab<-merge(mcc.ab.m[-which(mcc.ab.m$value==0),], dsi.ace8, by.x=c('Var1','Var2'), by.y=c('Sample_ID','sp'), all.x=T)
+dsi.spe.ab<-dsi.spe.ab[complete.cases(dsi.spe.ab),]
+
+# Calculate weighted means of ASV specialization scores by host species by site
+dsi.spa.ab<-NULL
+for (j in 1:length(unique(dsi.spe.ab$Var1))){
+    sub<-dsi.spe.ab[which(dsi.spe.ab$Var1==unique(dsi.spe.ab$Var1)[j]),]
+    if(nrow(sub)>0){
+    wgtv<-weighted.mean(sub$DSI.st, sub$value)
+    dsi.spa.ab<-rbind(dsi.spa.ab, c(as.character(unique(sub$site)), as.character(unique(dsi.spe.ab$Var1)[j]), wgtv))
+    }
+  }
+
+dsi.spa.ab<-as.data.frame(dsi.spa.ab)
+colnames(dsi.spa.ab)<-c('Site','Sample_ID','DSI.st')
+dsi.spa.ab$DSI.st<-as.numeric(as.character(dsi.spa.ab$DSI.st))
+
+
+```
+
+Examine relationship with abundance
+
+```{r}
+
+
+#### Transient object
+# spec.ab.old<-spec.ab
+
+# Append the local abundances
+spec.ab<-merge(dsi.spa.ab, comp.host.a[,c('ACESAC'), drop=F], by.x='Sample_ID', by.y='row.names', all.x=T)
+colnames(spec.ab)[ncol(spec.ab)]<-'ab.local'
+
+# Append the regional abundances
+spec.ab<-merge(spec.ab, comp.25.a[,c('ACESAC'), drop=F], by.x='Sample_ID', by.y='row.names', all.x=T)
+colnames(spec.ab)[ncol(spec.ab)]<-'ab.reg'
+
+
+# Plot variation in specialization
+# Abundance regional
+# Positive relationship
+ggplot(spec.ab, aes(x=ab.reg,y=DSI.st))+
+  geom_point()+
+  geom_smooth(method='lm', se=F)+
+  theme_bw()+
+  theme(axis.text = element_text(size=16), axis.title=element_text(size=16))+
+  labs(y='Specialization', x='Host regional abundance')
+
+# Model
+summary(lm(DSI.st~ab.local, spec.ab))
+
+summary(lm(DSI.st~ab.reg, spec.ab))
+
+```
+
+
+
